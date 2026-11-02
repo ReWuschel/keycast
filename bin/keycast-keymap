@@ -1,0 +1,156 @@
+#!/usr/bin/python3 -I
+"""Keycast key label table, read from the real xkb keymap.
+
+Usage: keycast-keymap RULES MODEL LAYOUT VARIANT OPTIONS
+
+Takes the keyboard settings Hyprland reports (`hyprctl -j devices`, empty
+strings for unset fields) and compiles them with libxkbcommon, so every
+layout, variant and option (Dvorak, AZERTY, caps:escape, compose:caps, ...)
+labels keys the way they actually type. Prints one JSON object:
+
+  {"layouts": [{"name": "German", "keys": {"30": ["a", "A", "æ", "a"], ...}}]}
+
+Each key holds the text it types plain, with Shift and with AltGr (empty
+when it types nothing), then the plain keysym name ("Return", "Control_L",
+"dead_acute") for keys without text. Codes are evdev codes, not xkb ones.
+Nothing is read from or written to disk except the system xkb data.
+"""
+
+import ctypes
+import ctypes.util
+import json
+import sys
+
+XKB_KEY_UP = 0
+XKB_KEY_DOWN = 1
+EVDEV_OFFSET = 8
+LAST_CODE = 255
+
+# Dead keys type nothing on their own; show the accent they add.
+DEAD = {
+    "dead_grave": "`", "dead_acute": "´", "dead_circumflex": "^", "dead_tilde": "~",
+    "dead_diaeresis": "¨", "dead_abovering": "°", "dead_cedilla": "¸", "dead_caron": "ˇ",
+    "dead_macron": "¯", "dead_breve": "˘", "dead_abovedot": "˙", "dead_ogonek": "˛",
+    "dead_doubleacute": "˝", "dead_stroke": "/", "dead_belowdot": ".",
+}
+
+
+class RuleNames(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_char_p) for name in ("rules", "model", "layout", "variant", "options")]
+
+
+def load():
+    path = ctypes.util.find_library("xkbcommon") or "libxkbcommon.so.0"
+    lib = ctypes.CDLL(path)
+    sigs = {
+        "xkb_context_new": ([ctypes.c_int], ctypes.c_void_p),
+        "xkb_context_unref": ([ctypes.c_void_p], None),
+        "xkb_keymap_new_from_names": ([ctypes.c_void_p, ctypes.POINTER(RuleNames), ctypes.c_int], ctypes.c_void_p),
+        "xkb_keymap_unref": ([ctypes.c_void_p], None),
+        "xkb_keymap_num_layouts": ([ctypes.c_void_p], ctypes.c_uint32),
+        "xkb_keymap_layout_get_name": ([ctypes.c_void_p, ctypes.c_uint32], ctypes.c_char_p),
+        "xkb_state_new": ([ctypes.c_void_p], ctypes.c_void_p),
+        "xkb_state_unref": ([ctypes.c_void_p], None),
+        "xkb_state_update_mask": ([ctypes.c_void_p] + [ctypes.c_uint32] * 6, ctypes.c_int),
+        "xkb_state_update_key": ([ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int], ctypes.c_int),
+        "xkb_state_key_get_one_sym": ([ctypes.c_void_p, ctypes.c_uint32], ctypes.c_uint32),
+        "xkb_state_key_get_utf8": ([ctypes.c_void_p, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_size_t], ctypes.c_int),
+        "xkb_keysym_get_name": ([ctypes.c_uint32, ctypes.c_char_p, ctypes.c_size_t], ctypes.c_int),
+    }
+    for name, (args, res) in sigs.items():
+        fn = getattr(lib, name)
+        fn.argtypes = args
+        fn.restype = res
+    return lib
+
+
+def sym_name(lib, sym):
+    buf = ctypes.create_string_buffer(64)
+    return buf.value.decode() if sym and lib.xkb_keysym_get_name(sym, buf, 64) > 0 else ""
+
+
+def text(lib, state, keycode):
+    buf = ctypes.create_string_buffer(32)
+    lib.xkb_state_key_get_utf8(state, keycode, buf, 32)
+    out = buf.value.decode(errors="replace")
+    if out and all(ord(c) >= 0x20 and ord(c) != 0x7F for c in out):
+        return out
+    name = sym_name(lib, lib.xkb_state_key_get_one_sym(state, keycode))
+    return DEAD.get(name, "")
+
+
+def find_key(lib, keymap, layout, wanted):
+    """xkb keycode whose plain keysym is `wanted` (e.g. Shift_L) in a layout."""
+    state = lib.xkb_state_new(keymap)
+    lib.xkb_state_update_mask(state, 0, 0, 0, 0, 0, layout)
+    try:
+        for code in range(1, LAST_CODE + 1):
+            if sym_name(lib, lib.xkb_state_key_get_one_sym(state, code + EVDEV_OFFSET)) in wanted:
+                return code + EVDEV_OFFSET
+    finally:
+        lib.xkb_state_unref(state)
+    return 0
+
+
+def level(lib, keymap, layout, modifier_key):
+    """A state locked to `layout` with `modifier_key` (xkb keycode, or 0) held."""
+    state = lib.xkb_state_new(keymap)
+    lib.xkb_state_update_mask(state, 0, 0, 0, 0, 0, layout)
+    if modifier_key:
+        lib.xkb_state_update_key(state, modifier_key, XKB_KEY_DOWN)
+    return state
+
+
+def table(lib, keymap, layout):
+    shift = find_key(lib, keymap, layout, ("Shift_L", "Shift_R"))
+    altgr = find_key(lib, keymap, layout, ("ISO_Level3_Shift", "Mode_switch"))
+    plain = level(lib, keymap, layout, 0)
+    shifted = level(lib, keymap, layout, shift)
+    third = level(lib, keymap, layout, altgr) if altgr else None
+    keys = {}
+    try:
+        for code in range(1, LAST_CODE + 1):
+            kc = code + EVDEV_OFFSET
+            sym = sym_name(lib, lib.xkb_state_key_get_one_sym(plain, kc))
+            if not sym or sym == "NoSymbol":
+                continue
+            keys[str(code)] = [
+                text(lib, plain, kc),
+                text(lib, shifted, kc) if shift else "",
+                text(lib, third, kc) if third else "",
+                sym,
+            ]
+    finally:
+        for state in (plain, shifted, third):
+            if state:
+                lib.xkb_state_unref(state)
+    return keys
+
+
+def main(argv):
+    if len(argv) != 5 or any(len(a) > 512 for a in argv):
+        print(__doc__.strip().splitlines()[2], file=sys.stderr)
+        return 2
+    lib = load()
+    context = lib.xkb_context_new(0)
+    if not context:
+        return 1
+    names = RuleNames(*[a.encode() or None for a in argv])
+    keymap = lib.xkb_keymap_new_from_names(context, ctypes.byref(names), 0)
+    if not keymap:
+        lib.xkb_context_unref(context)
+        print("keymap did not compile", file=sys.stderr)
+        return 1
+    layouts = []
+    for index in range(min(lib.xkb_keymap_num_layouts(keymap), 4)):
+        name = lib.xkb_keymap_layout_get_name(keymap, index)
+        layouts.append({"name": name.decode() if name else "", "keys": table(lib, keymap, index)})
+    lib.xkb_keymap_unref(keymap)
+    lib.xkb_context_unref(context)
+    json.dump({"layouts": layouts}, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

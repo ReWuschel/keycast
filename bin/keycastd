@@ -1,0 +1,241 @@
+#!/usr/bin/python3 -I
+"""Keycast input reader.
+
+Reads key and mouse button events straight from /dev/input/event* (the user
+must be in the `input` group) and prints one JSON object per line on stdout:
+
+  {"hello": 1, "devices": 3}        once at start and after every device change
+  {"k": 30, "v": 1}                 evdev key or button code, 1 = down, 0 = up
+  {"w": 1}                          wheel notch, +1 up, -1 down
+  {"denied": true}                  no readable device of a wanted kind
+  {"held": [29, 30]}                every 2 s: keys the kernel
+                                    reports as down, so a missed release cannot
+                                    leave a key lit forever
+
+Only codes are printed, never characters, and nothing is written anywhere
+else. The process exits as soon as stdin closes, so it lives exactly as long
+as the shell service that started it. Key repeat events are dropped.
+
+  --mouse         also read mouse devices (buttons and wheel). The kernel
+                  is asked (EVIOCSMASK) not to queue motion for this reader.
+  --no-keyboards  read mouse buttons and the wheel only. Used when the shell
+                  gets keyboard keys from Hyprland instead; the kernel is
+                  asked not to queue any keyboard key for this reader.
+"""
+
+import ctypes
+import fcntl
+import json
+import os
+import select
+import struct
+import sys
+import time
+
+EV_KEY = 0x01
+EV_REL = 0x02
+REL_WHEEL = 0x08
+KEY_A = 30
+BTN_LEFT = 0x110
+BTN_TASK = 0x117
+KEY_LIMIT = 0x100
+
+EVENT = struct.Struct("llHHi")
+RESCAN_SECONDS = 2.0
+READ_CHUNK = EVENT.size * 64
+
+
+def eviocgbit(ev, length):
+    # _IOC(_IOC_READ, 'E', 0x20 + ev, length)
+    return (2 << 30) | (length << 16) | (ord("E") << 8) | (0x20 + ev)
+
+
+def eviocgkey(length):
+    # _IOC(_IOC_READ, 'E', 0x18, length)
+    return (2 << 30) | (length << 16) | (ord("E") << 8) | 0x18
+
+
+def eviocsmask():
+    # _IOW('E', 0x93, struct input_mask), sizeof(struct input_mask) == 16
+    return (1 << 30) | (16 << 16) | (ord("E") << 8) | 0x93
+
+
+def wheel_only(fd):
+    """Ask the kernel to queue no mouse motion for this fd, only the wheel.
+
+    A 1000 Hz mouse otherwise fills the 64-event evdev buffer in about 20 ms,
+    and any delay in this process then cost button events (SYN_DROPPED).
+    """
+    # The kernel takes the bitmap in whole longs (8 bytes), else EINVAL.
+    codes = ctypes.create_string_buffer(8)
+    codes.raw = bytes([0, 1 << (REL_WHEEL - 8)]) + bytes(6)
+    mask = struct.pack("IIQ", EV_REL, len(codes.raw), ctypes.addressof(codes))
+    try:
+        fcntl.ioctl(fd, eviocsmask(), mask)
+    except OSError:
+        pass  # kernels before 4.4: motion is read and thrown away instead
+
+
+def buttons_only(fd):
+    """Ask the kernel to queue only mouse buttons from EV_KEY for this fd."""
+    bits = bytearray(96)  # KEY_CNT / 8, already a whole number of longs
+    for code in range(BTN_LEFT, BTN_TASK + 1):
+        bits[code // 8] |= 1 << (code % 8)
+    codes = ctypes.create_string_buffer(bytes(bits), len(bits))
+    mask = struct.pack("IIQ", EV_KEY, len(bits), ctypes.addressof(codes))
+    try:
+        fcntl.ioctl(fd, eviocsmask(), mask)
+    except OSError:
+        pass  # filtered below instead
+
+
+def has_bit(bits, n):
+    return len(bits) > n // 8 and bits[n // 8] & (1 << (n % 8))
+
+
+def classify(fd):
+    """(has keyboard keys, has mouse buttons) for an open device."""
+    try:
+        keys = fcntl.ioctl(fd, eviocgbit(EV_KEY, 96), bytes(96))
+    except OSError:
+        return False, False
+    return bool(has_bit(keys, KEY_A)), bool(has_bit(keys, BTN_LEFT))
+
+
+class Reader:
+    def __init__(self, want_keyboards, want_mouse):
+        self.want_keyboards = want_keyboards
+        self.want_mouse = want_mouse
+        self.devices = {}  # fd -> path
+        self.skipped = set()
+
+    def rescan(self):
+        changed = False
+        try:
+            names = os.listdir("/dev/input")
+        except OSError:
+            names = []
+        present = set()
+        for name in names:
+            if not name.startswith("event"):
+                continue
+            path = "/dev/input/" + name
+            present.add(path)
+            if path in self.devices.values() or path in self.skipped:
+                continue
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+            except OSError:
+                self.skipped.add(path)
+                continue
+            keyboard, mouse = classify(fd)
+            if (keyboard and self.want_keyboards) or (mouse and self.want_mouse):
+                wheel_only(fd)
+                if not self.want_keyboards:
+                    buttons_only(fd)
+                self.devices[fd] = path
+                changed = True
+            else:
+                os.close(fd)
+                self.skipped.add(path)
+        self.skipped &= present
+        for fd, path in list(self.devices.items()):
+            if path not in present:
+                self.drop(fd)
+                changed = True
+        return changed
+
+    def pressed(self):
+        """Keys the kernel reports as down right now, across all devices.
+
+        EVIOCGKEY flushes the EV_KEY events still queued for the fd it is
+        called on, so asking on the fd we read from silently ate any press
+        that was waiting in the queue at that moment. Ask through a separate,
+        short-lived fd instead; the flush then only empties that one.
+        """
+        down = set()
+        for path in list(self.devices.values()):
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+            except OSError:
+                continue
+            try:
+                bits = fcntl.ioctl(fd, eviocgkey(96), bytes(96))
+            except OSError:
+                continue
+            finally:
+                os.close(fd)
+            codes = range(1, KEY_LIMIT) if self.want_keyboards else ()
+            for code in list(codes) + list(range(BTN_LEFT, BTN_TASK + 1)):
+                if has_bit(bits, code):
+                    down.add(code)
+        return sorted(down)
+
+    def drop(self, fd):
+        self.devices.pop(fd, None)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def read(self, fd, out):
+        try:
+            data = os.read(fd, READ_CHUNK)
+        except BlockingIOError:
+            return
+        except OSError:
+            self.drop(fd)
+            return
+        for offset in range(0, len(data) - EVENT.size + 1, EVENT.size):
+            _, _, etype, code, value = EVENT.unpack_from(data, offset)
+            if etype == EV_KEY and value in (0, 1):
+                if (code < KEY_LIMIT and self.want_keyboards) or BTN_LEFT <= code <= BTN_TASK:
+                    out.append('{"k":%d,"v":%d}' % (code, value))
+            elif etype == EV_REL and code == REL_WHEEL and value:
+                out.append('{"w":%d}' % (1 if value > 0 else -1))
+
+
+def emit(lines):
+    if not lines:
+        return
+    sys.stdout.write("\n".join(lines) + "\n")
+    sys.stdout.flush()
+
+
+def main():
+    args = sys.argv[1:]
+    reader = Reader("--no-keyboards" not in args, "--mouse" in args)
+    stdin = sys.stdin.fileno()
+    reader.rescan()
+    emit([json.dumps({"hello": 1, "devices": len(reader.devices)})])
+    if not reader.devices:
+        emit(['{"denied":true}'])
+
+    next_scan = time.monotonic() + RESCAN_SECONDS
+    while True:
+        ready, _, _ = select.select([stdin] + list(reader.devices), [], [], RESCAN_SECONDS)
+        out = []
+        for fd in ready:
+            if fd == stdin:
+                if not os.read(stdin, 4096):
+                    return
+                continue
+            reader.read(fd, out)
+        emit(out)
+        # Checked after the queued events are out, so a key that changed
+        # between the read and this check is the only one the list can
+        # disagree with.
+        if time.monotonic() >= next_scan:
+            next_scan = time.monotonic() + RESCAN_SECONDS
+            if reader.rescan():
+                emit([json.dumps({"hello": 1, "devices": len(reader.devices)})])
+            # Sent on every scan, not only on change: the shell can hold a
+            # stale key while the kernel list stays the same (empty) for a
+            # long time, and a stale held key swallows its next press.
+            emit([json.dumps({"held": reader.pressed()}, separators=(",", ":"))])
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass

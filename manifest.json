@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.rewuschel.keycast",
+  "name": "Keycast",
+  "version": "1.0.0",
+  "author": "rewuschel",
+  "license": "MIT",
+  "description": "Keycaster overlay with two layouts: a stream of keys and shortcuts for screencasts, and a gamer board (WASD cluster, mouse, KPS/APM) that lights every held key. Reads keys locally through Hyprland or /dev/input; keys are never saved or sent anywhere.",
+  "kinds": ["service", "bar-widget"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Keycast",
+    "description": "On-screen keycaster: stream and gamer layouts, style, size, position, privacy",
+    "category": "Input",
+    "aliases": ["keycaster", "keys", "key-visualizer", "screencast-keys"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
